@@ -470,7 +470,6 @@ def train_gym(args):
     if args.use_wandb:
         wandb.init(config=args,
                    project=args.env_name,
-                   entity="greta",
                    name=args.algo_name + "_" + curr_run + "_" + datetime.datetime.now().strftime(
                        "%Y-%m-%d_%H-%M-%S"),
                    dir=save_path,
