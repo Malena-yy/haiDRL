@@ -1,0 +1,8 @@
+matplotlib
+gym
+pygame
+wandb
+numpy
+torch==2.0.1
+tensorboardX
+tensorboard
