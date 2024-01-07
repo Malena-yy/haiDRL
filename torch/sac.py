@@ -15,6 +15,7 @@ import random
 import gym
 import matplotlib.pyplot as plt
 from pathlib import Path
+from pprint import pprint
 import wandb
 
 base_dir = str(Path(__file__).resolve().parent.parent)
@@ -283,7 +284,7 @@ class SAC:
         self.training_step = 0
         self.writer = writer
 
-    def store_step_transition(self, state, action, reward, next_state, done):
+    def store_transition(self, state, action, reward, next_state, done):
         transition = self.Transition(state, action, reward, next_state, done)
         if len(self.buffer) < self.buffer_capacity:
             self.buffer.append(None)
@@ -443,7 +444,8 @@ def get_env_args(env_name, render=False) -> dict:
                 'action_space': env.action_space,
                 'action_dim': action_dim,
                 'if_discrete': if_discrete, }
-    print("env_args = {}".format(env_args))
+    print("============= env info ============")
+    pprint(env_args)
     env.close()
     return env_args
 
@@ -500,7 +502,7 @@ def train_gym(args):
                 action = model.select_action(state, True)
             next_state, reward, terminated, truncated, info = env.step(action)
             step += 1
-            model.store_step_transition(state, action, reward, next_state, terminated)
+            model.store_transition(state, action, reward, next_state, terminated)
             if len(model.buffer) >= 2000:
                 model.update()  # model training
                 train_count += 1
