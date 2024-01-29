@@ -223,8 +223,8 @@ class PPO:
                 self.critic_optimizer.step()
                 self.training_step += 1
                 if self.args.use_wandb:
-                    wandb.log({'critic loss': value_loss.item(),
-                               "actor loss": pi_loss.item()
+                    wandb.log({'loss/critic loss': value_loss.item(),
+                               "loss/actor loss": pi_loss.item()
                                })
                 if self.args.use_tensorboard:
                     self.writer.add_scalar('loss/critic loss', value_loss.item(), self.training_step)
@@ -362,9 +362,9 @@ def train_gym(args):
                 print("Episode:", episode, "; step:", step, "; Episode Return:", '%.2f' % ep_reward, "; final_reward:",
                       '%.2f' % reward, '; Trained episode:', train_count)
                 if args.use_wandb:
-                    wandb.log({'ep_reward': ep_reward,
-                               "final_reward": reward,
-                               "ep_step": step})
+                    wandb.log({'reward/ep_reward': ep_reward,
+                               "reward/final_reward": reward,
+                               "reward/ep_step": step})
                 if args.use_tensorboard:
                     tf_writer.add_scalar('reward/step', step, episode)
                     tf_writer.add_scalar('reward/final_reward', reward, episode)

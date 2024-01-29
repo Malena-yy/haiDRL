@@ -32,19 +32,19 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--env_name', default="Pendulum-v1", type=str)
 parser.add_argument('--algo_name', default="iql", type=str)
 parser.add_argument('--offline_data_path', default="./offline_data/Pendulum-v1_sac.csv", type=str)
-parser.add_argument('--max_train_step', default=80000, type=int)
+parser.add_argument('--max_train_step', default=40000, type=int)
 parser.add_argument('--eval_episode_cnt', default=5, type=int)
 parser.add_argument('--eval_per_step', default=200, type=int)
 parser.add_argument('--hidden_dim', default=256, type=int)
 parser.add_argument('--buffer_capacity', default=int(1e5), type=int)
 parser.add_argument('--batch_size', default=256, type=int)
-parser.add_argument('--lr_actor', default=0.0001, type=float)
-parser.add_argument('--lr_critic', default=0.0001, type=float)
-parser.add_argument('--lr_value', default=0.0001, type=float)
-parser.add_argument('--expectile', default=0.7, type=float)
-parser.add_argument('--temperature', default=1.0, type=float)
+parser.add_argument('--lr_actor', default=0.001, type=float)
+parser.add_argument('--lr_critic', default=0.001, type=float)
+parser.add_argument('--lr_value', default=0.001, type=float)
+parser.add_argument('--expectile', default=0.9, type=float)
+parser.add_argument('--temperature', default=10.0, type=float)
 parser.add_argument('--gamma', default=0.99, type=float)
-parser.add_argument('--replace_tau', default=0.005, type=float)
+parser.add_argument('--replace_tau', default=0.001, type=float)
 parser.add_argument('--random_seed', default=2024, type=int)
 parser.add_argument("--save_interval", default=100, type=int)
 # eval
@@ -53,7 +53,7 @@ parser.add_argument("--load_episode", default=300, type=int, help="load the mode
 parser.add_argument('--eval_episode', default=30, type=int, help="the number of episode to eval the model")
 # logging choice
 parser.add_argument("--use_tensorboard", default=0, type=int, help="1 as true, 0 as false")
-parser.add_argument("--use_wandb", default=0, type=int, help="1 as true, 0 as false")
+parser.add_argument("--use_wandb", default=1, type=int, help="1 as true, 0 as false")
 
 device = 'cpu'
 LOG_SIG_MAX = 2
@@ -148,23 +148,23 @@ class Actor(nn.Module):
         log_std = torch.clamp(log_std, min=LOG_SIG_MIN, max=LOG_SIG_MAX)
         return mu, log_std
 
-    def evaluate(self, obs):
-        mu, log_std = self.forward(obs)
+    def evaluate(self, state):
+        mu, log_std = self.forward(state)
         std = log_std.exp()
         dist = Normal(mu, std)
         action = dist.rsample()
         return action, dist
 
-    def get_action(self, obs):
-        mu, log_std = self.forward(obs)
+    def get_action(self, state):
+        mu, log_std = self.forward(state)
         std = log_std.exp()
         dist = Normal(mu, std)
         sample_action = dist.rsample()
         sample_action = torch.tanh(sample_action) * self.action_scale + self.action_bias
         return sample_action
 
-    def get_det_action(self, obs):
-        mu, _ = self.forward(obs)
+    def get_det_action(self, state):
+        mu, _ = self.forward(state)
         mean_action = torch.tanh(mu) * self.action_scale + self.action_bias
         return mean_action
 
@@ -228,6 +228,7 @@ class IQL:
         self.action_dim = action_space.shape[0]
         self.action_scale = torch.FloatTensor((action_space.high - action_space.low) / 2.)
         self.action_bias = torch.FloatTensor((action_space.high + action_space.low) / 2.)
+
         self.lr_critic = args.lr_critic
         self.lr_value = args.lr_value
         self.lr_actor = args.lr_actor
@@ -272,10 +273,10 @@ class IQL:
         dones = torch.tensor(dones, dtype=torch.float).to(device).unsqueeze(1)
         # update value net
         with torch.no_grad():
-            q1, q2 = self.target_critic_net(states, actions)
-            min_Q = torch.min(q1, q2)
+            target_q1, target_q2 = self.target_critic_net(states, actions)
+            min_target_q = torch.min(target_q1, target_q2)
         value = self.value_net(states)
-        value_loss = self.l2_loss(min_Q - value, self.expectile).mean()
+        value_loss = self.l2_loss(min_target_q - value, self.expectile).mean()
         self.value_optimizer.zero_grad()
         value_loss.backward()
         self.value_optimizer.step()
@@ -283,15 +284,13 @@ class IQL:
         # update actor network
         with torch.no_grad():
             v = self.value_net(states)
-            q1, q2 = self.target_critic_net(states, actions)
-            min_q_pi = torch.min(q1, q2)
 
         '''
             where temperature in [0;1) is an inverse temperature.
             For smaller hyperparameter values, the objective behaves similarly to behavioral cloning, 
             while for larger values, it attempts to recover the  maximum of the Q-function.
         '''
-        exp_a = torch.exp(min_q_pi - v) * self.temperature
+        exp_a = torch.exp(min_target_q - v) * self.temperature
         exp_a = torch.min(exp_a, torch.FloatTensor([100.0]))
         _, dist = self.actor_net.evaluate(states)
         log_probs = dist.log_prob(actions)
@@ -309,7 +308,7 @@ class IQL:
         q1, q2 = self.critic_net(states, actions)
         q1_loss = 0.5 * F.mse_loss(q1, q_target)
         q2_loss = 0.5 * F.mse_loss(q2, q_target)
-        q_loss = torch.mean(q1_loss + q2_loss)
+        q_loss = q1_loss + q2_loss
         self.critic_net_optimizer.zero_grad()
         q_loss.backward()
         # nn.utils.clip_grad_norm_(self.critic_net.parameters(), self.max_grad_norm)
@@ -324,17 +323,18 @@ class IQL:
             wandb.log({'loss/critic loss': q_loss.item(),
                        "loss/actor loss": actor_loss.item(),
                        "loss/value loss": value_loss.item(),
-                       "loss/adv":(min_q_pi - v).items()
+                       "loss/adv": (min_target_q - v).mean().item()
                        })
         if self.args.use_tensorboard:
             self.writer.add_scalar('loss/critic loss', q_loss.item(), self.training_step)
             self.writer.add_scalar('loss/actor loss', actor_loss.item(), self.training_step)
             self.writer.add_scalar('loss/value loss', value_loss.item(), self.training_step)
+            self.writer.add_scalar('loss/adv', (min_target_q - v).mean().item(), self.training_step)
 
         return {'loss/critic loss': q_loss.item(),
                 "loss/actor loss": actor_loss.item(),
                 "loss/value loss": value_loss.item(),
-                "loss/adv": (min_q_pi - v).items()
+                "loss/adv": (min_target_q - v).mean().item()
                 }
 
     def save(self, save_path, episode):
@@ -459,14 +459,26 @@ def train_with_offline_data(args):
     model = IQL(args, state_dim, action_space, replay_buffer, writer=tf_writer)
 
     train_step = 0
-    plt_step = []
+    plt_train_step = []
+    plt_ep_step = []
     plt_ep_reward = []
+    plt_critic_loss = []
+    plt_actor_loss = []
+    plt_value_loss = []
+    plt_adv = []
     while train_step < args.max_train_step:
         train_step += 1
         train_info = model.update()  # model training
         # eval
         if train_step != 0 and train_step % args.eval_per_step == 0:
             print(train_info)
+            plt_train_step.append(train_step)
+            plt_critic_loss.append(train_info['loss/critic loss'])
+            plt_actor_loss.append(train_info['loss/actor loss'])
+            plt_value_loss.append(train_info['loss/value loss'])
+            plt_adv.append(train_info['loss/adv'])
+            ep_reward_list = []
+            step_list = []
             for episode in range(args.eval_episode_cnt):
                 state, info = env.reset(seed=args.random_seed)
                 step = 0
@@ -479,24 +491,31 @@ def train_with_offline_data(args):
                     # 累加奖励
                     ep_reward += reward
                     if terminated or truncated:
+                        ep_reward_list.append(ep_reward)
+                        step_list.append(step)
                         eval_info = {"train_step": train_step, "eval_episode": episode, "step": step,
                                      "ep_reward": round(ep_reward, 2)}
                         print(eval_info)
-                        if args.use_wandb:
-                            wandb.log({'reward/ep_reward': ep_reward,
-                                       "reward/ep_step": step})
-                        if args.use_tensorboard:
-                            tf_writer.add_scalar('reward/step', step, episode)
-                            tf_writer.add_scalar('reward/ep_reward', ep_reward, episode)
                         break
-                plt_step.append(step)
-                plt_ep_reward.append(ep_reward)
+            ep_reward = round(sum(ep_reward_list) / len(ep_reward_list), 2)
+            step = round(sum(step_list) / len(step_list), 2)
+            if args.use_wandb:
+                wandb.log({'reward/ep_reward': ep_reward,
+                           "reward/ep_step": step})
+            if args.use_tensorboard:
+                tf_writer.add_scalar('reward/ep_reward', ep_reward, train_step)
+                tf_writer.add_scalar('reward/step', step, train_step)
+            plt_ep_step.append(step)
+            plt_ep_reward.append(ep_reward)
     model.save(save_path, args.max_train_step)
     env.close()
     wandb.finish()
     # 保存模型配置，即生成config.yaml
     save_config(args, save_path)
-    # plot result
+    fig_path = os.path.join(save_path, "figs")
+    if not os.path.exists(fig_path):
+        os.makedirs(fig_path)
+    # plot reward result
     p1 = plt.figure(figsize=(16, 8))
 
     ax1 = p1.add_subplot(1, 2, 1)
@@ -506,29 +525,69 @@ def train_with_offline_data(args):
     ax2.tick_params(labelsize=12)
     ax2.grid(linestyle='-.')
 
-    ax1.plot([i + 1 for i in range(len(plt_step))], plt_step)
-    ax1.set_xlabel('Number of training episodes', font1)
+    ax1.plot(plt_train_step, plt_ep_step)
+    ax1.set_xlabel('Number of training steps', font1)
     ax1.set_ylabel('steps', font1)
 
     label1 = ax1.get_xticklabels() + ax1.get_yticklabels()
     [label.set_fontname('Times New Roman') for label in label1]
 
-    label1 = ax1.get_xticklabels() + ax1.get_yticklabels()
-    [label.set_fontname('Times New Roman') for label in label1]
-
-    ax2.plot([i + 1 for i in range(len(plt_ep_reward))], plt_ep_reward)
-    ax2.set_xlabel('Number of training episodes', font1)
+    ax2.plot(plt_train_step, plt_ep_reward)
+    ax2.set_xlabel('Number of training steps', font1)
     ax2.set_ylabel(r'ep_reward', font1)
 
     label2 = ax2.get_xticklabels() + ax2.get_yticklabels()
     [label.set_fontname('Times New Roman') for label in label2]
 
     plt.subplots_adjust(wspace=0.3)
-    fig_path = os.path.join(save_path, "figs")
-    if not os.path.exists(fig_path):
-        os.makedirs(fig_path)
-    plt.savefig(os.path.join(fig_path, "train_fig.jpg"))
-    print("train figure is saved in {}".format(str(os.path.join(fig_path, "train_fig.jpg"))))
+    plt.savefig(os.path.join(fig_path, "train_reward_fig.jpg"))
+    # plot loss result
+    p1 = plt.figure(figsize=(12, 10))
+
+    ax1 = p1.add_subplot(2, 2, 1)
+    ax1.tick_params(labelsize=12)
+    ax1.grid(linestyle='-.')
+    ax2 = p1.add_subplot(2, 2, 2)
+    ax2.tick_params(labelsize=12)
+    ax2.grid(linestyle='-.')
+    ax3 = p1.add_subplot(2, 2, 3)
+    ax3.tick_params(labelsize=12)
+    ax3.grid(linestyle='-.')
+    ax4 = p1.add_subplot(2, 2, 4)
+    ax4.tick_params(labelsize=12)
+    ax4.grid(linestyle='-.')
+
+    ax1.plot(plt_train_step, plt_critic_loss)
+    ax1.set_xlabel('Number of training steps', font1)
+    ax1.set_ylabel('critic loss', font1)
+
+    label1 = ax1.get_xticklabels() + ax1.get_yticklabels()
+    [label.set_fontname('Times New Roman') for label in label1]
+
+    ax2.plot(plt_train_step, plt_actor_loss)
+    ax2.set_xlabel('Number of training steps', font1)
+    ax2.set_ylabel(r'actor loss', font1)
+
+    label2 = ax2.get_xticklabels() + ax2.get_yticklabels()
+    [label.set_fontname('Times New Roman') for label in label2]
+
+    ax3.plot(plt_train_step, plt_value_loss)
+    ax3.set_xlabel('Number of training steps', font1)
+    ax3.set_ylabel('value loss', font1)
+
+    label3 = ax3.get_xticklabels() + ax3.get_yticklabels()
+    [label.set_fontname('Times New Roman') for label in label3]
+
+    ax4.plot(plt_train_step, plt_adv)
+    ax4.set_xlabel('Number of training steps', font1)
+    ax4.set_ylabel(r'adv', font1)
+
+    label4 = ax4.get_xticklabels() + ax4.get_yticklabels()
+    [label.set_fontname('Times New Roman') for label in label4]
+
+    plt.subplots_adjust(wspace=0.3)
+    plt.savefig(os.path.join(fig_path, "train_loss_fig.jpg"))
+    print("train figure is saved in {}".format(str(fig_path)))
     print("训练时间:{}".format(time.time() - begin_time))
 
 
@@ -601,6 +660,6 @@ if __name__ == '__main__':
     # get_env_args(args.env_name, render=False)
     train_with_offline_data(args)
     # specify which model to be load and eval
-    # args.load_run = 1
-    # args.load_episode = 60000
-    # eval_gym(args)
+    args.load_run = 1
+    args.load_episode = 40000
+    eval_gym(args)
