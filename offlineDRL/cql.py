@@ -16,6 +16,8 @@ import gym
 import matplotlib.pyplot as plt
 from pathlib import Path
 from pprint import pprint
+import pandas as pd
+import  ast
 import wandb
 
 base_dir = str(Path(__file__).resolve().parent.parent)
@@ -28,9 +30,11 @@ font1 = {'family': 'Times New Roman',
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--env_name', default="Pendulum-v1", type=str)
-parser.add_argument('--algo_name', default="sac", type=str)
+parser.add_argument('--algo_name', default="cql", type=str)
 parser.add_argument('--offline_data_path', default="./offline_data/Pendulum-v1_sac.csv", type=str)
-parser.add_argument('--max_train_step', default=80000, type=int)
+parser.add_argument('--max_train_step', default=40000, type=int)
+parser.add_argument('--eval_episode_cnt', default=5, type=int)
+parser.add_argument('--eval_per_step', default=200, type=int)
 parser.add_argument('--max_episode', default=200, type=int)
 parser.add_argument('--max_step', default=200, type=int)
 parser.add_argument('--hidden_dim', default=128, type=int)
@@ -42,6 +46,8 @@ parser.add_argument('--lr_alpha', default=0.001, type=float)
 parser.add_argument('--replace_tau', default=0.001, type=float)
 parser.add_argument('--alpha', default=0.2, type=float)
 parser.add_argument('--gamma', default=0.99, type=float)
+parser.add_argument('--beta', default=5.0, type=float)
+parser.add_argument('--num_random', default=5, type=int)
 parser.add_argument("--update_time", default=1, type=int)
 parser.add_argument('--random_seed', default=2024, type=int)
 parser.add_argument("--save_interval", default=100, type=int)
@@ -50,7 +56,7 @@ parser.add_argument("--load_run", default=1, type=int, help="load the model of r
 parser.add_argument("--load_episode", default=300, type=int, help="load the model trained for `load_episode` episode")
 parser.add_argument('--eval_episode', default=30, type=int, help="the number of episode to eval the model")
 # logging choice
-parser.add_argument("--use_tensorboard", default=1, type=int, help="1 as true, 0 as false")
+parser.add_argument("--use_tensorboard", default=0, type=int, help="1 as true, 0 as false")
 parser.add_argument("--use_wandb", default=0, type=int, help="1 as true, 0 as false")
 
 device = 'cpu'
@@ -88,6 +94,7 @@ def save_config(args, save_path):
     yaml.dump(vars(args), file)
     file.close()
 
+
 # ========================================= ReplayBuffer ======================================
 class ReplayBuffer:
     """
@@ -115,11 +122,13 @@ class ReplayBuffer:
         """返回当前缓冲区的大小"""
         return len(self.buffer)
 
+
 # ====================================  NET CONSTRUCTION ===============================
 def weights_init_(m):
     if isinstance(m, nn.Linear):
         torch.nn.init.xavier_uniform_(m.weight, gain=1)
         torch.nn.init.uniform_(m.bias, a=-0.003, b=0.003)
+
 
 class Actor(nn.Module):
     def __init__(self, state_dim, action_space, hidden_dim=128):
@@ -184,13 +193,13 @@ class Critic(nn.Module):
 
 # ====================================  ALGO CONSTRUCTION ===============================
 class CQL:
-    def __init__(self, args, state_dim=None, action_space=None, is_cnn=False, writer=None):
+    def __init__(self, args, state_dim=None, action_space=None, replay_buffer=None, writer=None):
         super(CQL, self).__init__()
         self.args = args
         self.alpha = args.alpha
         self.batch_size = args.batch_size
+        self.replay_buffer = replay_buffer
         self.update_time = args.update_time
-        self.is_cnn = is_cnn
         self.gamma = args.gamma
         self.action_space = action_space
         self.state_dim = state_dim
@@ -207,14 +216,12 @@ class CQL:
         self.buffer_capacity = args.buffer_capacity
         self.buffer_pointer = 0
 
-        if is_cnn:
-            self.critic_net = CNN_Critic(action_space)
-            self.target_critic_net = CNN_Critic(action_space)
-            self.actor_net = CNN_Actor(action_space)
-        else:
-            self.critic_net = Critic(state_dim, action_space, args.hidden_dim)
-            self.target_critic_net = Critic(state_dim, action_space, args.hidden_dim)
-            self.actor_net = Actor(state_dim, action_space, args.hidden_dim)
+        self.beta = args.beta  # CQL损失函数中的系数
+        self.num_random = args.num_random  # CQL中的动作采样数
+
+        self.critic_net = Critic(state_dim, action_space, args.hidden_dim)
+        self.target_critic_net = Critic(state_dim, action_space, args.hidden_dim)
+        self.actor_net = Actor(state_dim, action_space, args.hidden_dim)
 
         self.target_critic_net.load_state_dict(self.critic_net.state_dict())
         self.critic_net_optimizer = optim.Adam(self.critic_net.parameters(), lr=self.lr_critic)
@@ -235,85 +242,122 @@ class CQL:
         self.buffer_pointer = (self.buffer_pointer + 1) % self.buffer_capacity
 
     def select_action(self, state, train=True):
-        if self.is_cnn:
-            state = torch.from_numpy(state).float().unsqueeze(0).unsqueeze(0).to(device)
-        else:
-            state = torch.tensor(state, dtype=torch.float).unsqueeze(0)
+        state = torch.tensor(state, dtype=torch.float).unsqueeze(0)
         action, log_prob, mean_action = self.actor_net(state)
         if not train:
             action = mean_action
         return action.detach().cpu().numpy()[0]
 
     def update(self):
-        state = torch.tensor(np.array([t.state for t in self.buffer]), dtype=torch.float).to(device)
-        action = torch.tensor(np.array([t.action for t in self.buffer]), dtype=torch.float).to(device)
-        reward = torch.tensor(np.array([t.reward for t in self.buffer]), dtype=torch.float).to(device).unsqueeze(1)
-        next_state = torch.tensor(np.array([t.next_state for t in self.buffer]), dtype=torch.float).to(device)
-        terminal = torch.tensor(np.array([t.done for t in self.buffer]), dtype=torch.float).to(device).unsqueeze(1)
-        for i in range(self.update_time):
-            index = np.random.choice(len(self.buffer), self.batch_size)
-            with torch.no_grad():
-                if self.is_cnn:
-                    next_state_action, next_action_log_prob, _ = self.actor_net(next_state[index].unsqueeze(1))
-                    q1_next_target, q2_next_target = self.target_critic_net(next_state[index].unsqueeze(1),
-                                                                            next_state_action)
-                    min_q_next_target = torch.min(q1_next_target, q2_next_target) - self.alpha * next_action_log_prob
-                    next_q_value = reward[index] + (1 - terminal[index]) * self.gamma * (min_q_next_target)
-                else:
-                    next_state_action, next_action_log_prob, _ = self.actor_net(next_state[index])
-                    q1_next_target, q2_next_target = self.target_critic_net(next_state[index], next_state_action)
-                    min_q_next_target = torch.min(q1_next_target,
-                                                  q2_next_target) - self.log_alpha.exp() * next_action_log_prob
-                    next_q_value = reward[index] + (1 - terminal[index]) * self.gamma * (min_q_next_target)
-            if self.is_cnn:
-                q1, q2 = self.critic_net(state[index].unsqueeze(1), action[index])
-            else:
-                q1, q2 = self.critic_net(state[index], action[index])
-            q1_loss = 0.5 * F.mse_loss(q1, next_q_value)
-            q2_loss = 0.5 * F.mse_loss(q2, next_q_value)
-            q_loss = torch.mean(q1_loss + q2_loss)
-            # update critic network
-            self.critic_net_optimizer.zero_grad()
-            q_loss.backward()
-            # nn.utils.clip_grad_norm_(self.critic_net.parameters(), self.max_grad_norm)
-            self.critic_net_optimizer.step()
+        states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
+        states = torch.tensor(states, dtype=torch.float).to(device)
+        actions = torch.tensor(actions, dtype=torch.float).to(device)
+        rewards = torch.tensor(rewards, dtype=torch.float).to(device).unsqueeze(1)
+        next_states = torch.tensor(next_states, dtype=torch.float).to(device)
+        dones = torch.tensor(dones, dtype=torch.float).to(device).unsqueeze(1)
 
-            # update actor network
-            if self.is_cnn:
-                pi, pi_log_prob, _ = self.actor_net(state[index].unsqueeze(1))
-                q1_pi, q2_pi = self.critic_net(state[index].unsqueeze(1), pi)
-            else:
-                pi, pi_log_prob, _ = self.actor_net(state[index])
-                q1_pi, q2_pi = self.critic_net(state[index], pi)
+        with torch.no_grad():
+            next_state_action, next_action_log_prob, _ = self.actor_net(next_states)
+            q1_next_target, q2_next_target = self.target_critic_net(next_states, next_state_action)
+            min_q_next_target = torch.min(q1_next_target,
+                                          q2_next_target) - self.log_alpha.exp() * next_action_log_prob
+            next_q_value = rewards + (1 - dones) * self.gamma * (min_q_next_target)
 
-            min_q_pi = torch.min(q1_pi, q2_pi)
-            pi_loss = torch.mean(self.log_alpha.exp() * pi_log_prob - min_q_pi)
-            self.actor_optimizer.zero_grad()
-            pi_loss.backward()
-            # nn.utils.clip_grad_norm_(self.actor_net.parameters(), self.max_grad_norm)
-            self.actor_optimizer.step()
+        q1, q2 = self.critic_net(states, actions)
+        q1_loss = 0.5 * F.mse_loss(q1, next_q_value)
+        q2_loss = 0.5 * F.mse_loss(q2, next_q_value)
 
-            # update alpha
-            alpha_loss = torch.mean(-(self.log_alpha.exp() * (pi_log_prob + self.target_entropy).detach()))
-            self.alpha_optimizer.zero_grad()
-            alpha_loss.backward()
-            self.alpha_optimizer.step()
-            self.alpha = self.log_alpha.exp().detach()
-            self.training_step += 1
-            if self.args.use_wandb:
-                wandb.log({'critic loss': q_loss.item(),
-                           "actor loss": pi_loss.item(),
-                           "alpha loss": alpha_loss.item(),
-                           "alpha": self.alpha.clone().item()
-                           })
-            if self.args.use_tensorboard:
-                self.writer.add_scalar('loss/critic loss', q_loss.item(), self.training_step)
-                self.writer.add_scalar('loss/actor loss', pi_loss.item(), self.training_step)
-                self.writer.add_scalar('loss/alpha loss', alpha_loss.item(), self.training_step)
-                self.writer.add_scalar('loss/alpha', self.alpha.clone().item(), self.training_step)
+        # 以下Q网络更新是CQL的额外部分
+        batch_size = states.shape[0]
+        random_unif_actions = torch.rand([batch_size * self.num_random, actions.shape[-1]], dtype=torch.float).uniform_(
+            -1, 1) * self.action_scale + self.action_bias
+        random_unif_actions=random_unif_actions.to(device)
+
+        random_unif_log_pi = np.log(0.5 ** next_state_action.shape[-1])
+        tmp_states = states.unsqueeze(1).repeat(1, self.num_random, 1).view(-1, states.shape[-1])
+        tmp_next_states = next_states.unsqueeze(1).repeat(1, self.num_random, 1).view(-1, next_states.shape[-1])
+
+        random_curr_actions, random_curr_log_pi, _ = self.actor_net(tmp_states)
+        random_next_actions, random_next_log_pi, _ = self.actor_net(tmp_next_states)
+
+        q1_unif, q2_unif = self.critic_net(tmp_states, random_unif_actions)
+        q1_unif = q1_unif.view(-1, self.num_random, 1)
+        q2_unif = q2_unif.view(-1, self.num_random, 1)
+
+        q1_curr, q2_curr = self.critic_net(tmp_states, random_curr_actions)
+        q1_curr = q1_curr.view(-1, self.num_random, 1)
+        q2_curr = q2_curr.view(-1, self.num_random, 1)
+
+        q1_next, q2_next = self.critic_net(tmp_states, random_next_actions)
+        q1_next = q1_next.view(-1, self.num_random, 1)
+        q2_next = q2_next.view(-1, self.num_random, 1)
+
+        q1_cat = torch.cat([
+            q1_unif - random_unif_log_pi,
+            q1_curr - random_curr_log_pi.detach().view(-1, self.num_random, 1),
+            q1_next - random_next_log_pi.detach().view(-1, self.num_random, 1)
+        ], dim=1)
+        q2_cat = torch.cat([
+            q2_unif - random_unif_log_pi,
+            q2_curr - random_curr_log_pi.detach().view(-1, self.num_random, 1),
+            q2_next - random_next_log_pi.detach().view(-1, self.num_random, 1)
+        ], dim=1)
+
+        qf1_loss_1 = torch.logsumexp(q1_cat, dim=1).mean()
+        qf2_loss_1 = torch.logsumexp(q2_cat, dim=1).mean()
+        qf1_loss_2, qf2_loss_2 = self.critic_net(states, actions)
+        qf1_loss_2 = qf1_loss_2.mean()
+        qf2_loss_2 = qf2_loss_2.mean()
+        qf1_loss = q1_loss + self.beta * (qf1_loss_1 - qf1_loss_2)
+        qf2_loss = q2_loss + self.beta * (qf2_loss_1 - qf2_loss_2)
+
+        qf_loss = torch.mean(qf1_loss + qf2_loss)
+        # update critic network
+        self.critic_net_optimizer.zero_grad()
+        qf_loss.backward()
+        # nn.utils.clip_grad_norm_(self.critic_net.parameters(), self.max_grad_norm)
+        self.critic_net_optimizer.step()
+
+        # update actor network
+        pi, pi_log_prob, _ = self.actor_net(states)
+        q1_pi, q2_pi = self.critic_net(states, pi)
+        min_q_pi = torch.min(q1_pi, q2_pi)
+        pi_loss = torch.mean(self.log_alpha.exp() * pi_log_prob - min_q_pi)
+        self.actor_optimizer.zero_grad()
+        pi_loss.backward()
+        # nn.utils.clip_grad_norm_(self.actor_net.parameters(), self.max_grad_norm)
+        self.actor_optimizer.step()
+
+        # update alpha
+        alpha_loss = torch.mean(-(self.log_alpha.exp() * (pi_log_prob + self.target_entropy).detach()))
+        self.alpha_optimizer.zero_grad()
+        alpha_loss.backward()
+        self.alpha_optimizer.step()
+        self.alpha = self.log_alpha.exp().detach()
+
         for target_param, source_param in zip(self.target_critic_net.parameters(), self.critic_net.parameters()):
             target_param.data.copy_(
                 target_param.data * (1.0 - self.replace_tau) + source_param.data * self.replace_tau)
+
+        self.training_step += 1
+
+        if self.args.use_wandb:
+            wandb.log({"loss/critic loss": qf_loss.item(),
+                       "loss/actor loss": pi_loss.item(),
+                       "loss/alpha loss": alpha_loss.item(),
+                       "loss/alpha": self.alpha.clone().item()
+                       })
+        if self.args.use_tensorboard:
+            self.writer.add_scalar('loss/critic loss', qf_loss.item(), self.training_step)
+            self.writer.add_scalar('loss/actor loss', pi_loss.item(), self.training_step)
+            self.writer.add_scalar('loss/alpha loss', alpha_loss.item(), self.training_step)
+            self.writer.add_scalar('loss/alpha', self.alpha.clone().item(), self.training_step)
+        return {"loss/critic loss": qf_loss.item(),
+                   "loss/actor loss": pi_loss.item(),
+                   "loss/alpha loss": alpha_loss.item(),
+                   "loss/alpha": self.alpha.clone().item()
+               }
+
 
     def save(self, save_path, episode):
         base_path = os.path.join(save_path, 'trained_model')
@@ -393,9 +437,19 @@ def get_env_args(env_name, render=False) -> dict:
     return env_args
 
 
-def train_gym(args):
+def train_with_offline_data(args):
     begin_time = time.time()
-    print("env_name:{}".format(args.env_name))
+    replay_buffer = ReplayBuffer()
+    print("offline_data_path:{}".format(args.offline_data_path))
+    data_loader = pd.read_csv(args.offline_data_path)
+    print("offline_data_index:{}".format(data_loader.index))
+    print("offline_data_shape:{}".format(data_loader.shape))
+    data_loader["state"] = data_loader["state"].apply(ast.literal_eval)
+    data_loader["action"] = data_loader["action"].apply(ast.literal_eval)
+    data_loader["next_state"] = data_loader["next_state"].apply(ast.literal_eval)
+    for index, row in data_loader.iterrows():
+        replay_buffer.add(row["state"], row["action"], row["reward"], row["next_state"], row["done"])
+    print("success to add {} offline_data to replay_buffer".format(replay_buffer.__len__()))
     # render gym or not
     RENDER = False
     if RENDER:
@@ -426,52 +480,67 @@ def train_gym(args):
     else:
         tf_writer = None
     # 创建智能体
-    model = SAC(args, state_dim, action_space, is_cnn=False, writer=tf_writer)
+    model = CQL(args, state_dim, action_space, replay_buffer, writer=tf_writer)
 
-    episode = 0
-    train_count = 0
-    plt_ep = []
-    plt_step = []
+    train_step = 0
+    plt_train_step = []
+    plt_ep_step = []
     plt_ep_reward = []
-    while episode < args.max_episode:
-        state, info = env.reset(seed=args.random_seed)
-        episode += 1
-        step = 0
-        ep_reward = 0
-        while True:
-            if episode < 10:
-                action = env.action_space.sample()
-            else:
-                action = model.select_action(state, True)
-            next_state, reward, terminated, truncated, info = env.step(action)
-            step += 1
-            model.store_transition(state, action, reward, next_state, terminated)
-            if len(model.buffer) >= 2000:
-                model.update()  # model training
-                train_count += 1
-            state = next_state
-            # 累加奖励
-            ep_reward += reward
-            if terminated or truncated:
-                print("Episode:", episode, "; step:", step, "; Episode Return:", '%.2f' % ep_reward,
-                      '; Trained episode:', train_count)
-                if args.use_wandb:
-                    wandb.log({'ep_reward': ep_reward,
-                               "ep_step": step})
-                if args.use_tensorboard:
-                    tf_writer.add_scalar('reward/step', step, episode)
-                    tf_writer.add_scalar('reward/ep_reward', ep_reward, episode)
-                plt_ep.append(episode)
-                plt_step.append(step)
-                plt_ep_reward.append(ep_reward)
-                break
-        if (episode >= 0.5 * args.max_episode and episode % args.save_interval == 0) or episode == args.max_episode:
-            model.save(save_path, episode)
+    plt_critic_loss = []
+    plt_actor_loss = []
+    plt_alpha_loss = []
+    plt_alpha = []
+    while train_step < args.max_train_step:
+        train_step += 1
+        train_info = model.update()  # model training
+        # eval
+        if train_step != 0 and train_step % args.eval_per_step == 0:
+            print(train_info)
+            plt_train_step.append(train_step)
+            plt_critic_loss.append(train_info['loss/critic loss'])
+            plt_actor_loss.append(train_info['loss/actor loss'])
+            plt_alpha_loss.append(train_info['loss/alpha loss'])
+            plt_alpha.append(train_info['loss/alpha'])
+            ep_reward_list = []
+            step_list = []
+            for episode in range(args.eval_episode_cnt):
+                state, info = env.reset(seed=args.random_seed)
+                step = 0
+                ep_reward = 0
+                while True:
+                    action = model.select_action(state, True)
+                    next_state, reward, terminated, truncated, info = env.step(action)
+                    step += 1
+                    state = next_state
+                    # 累加奖励
+                    ep_reward += reward
+                    if terminated or truncated:
+                        ep_reward_list.append(ep_reward)
+                        step_list.append(step)
+                        eval_info = {"train_step": train_step, "eval_episode": episode, "step": step,
+                                     "ep_reward": round(ep_reward, 2)}
+                        print(eval_info)
+                        break
+            ep_reward = round(sum(ep_reward_list) / len(ep_reward_list), 2)
+            step = round(sum(step_list) / len(step_list), 2)
+            if args.use_wandb:
+                wandb.log({'reward/ep_reward': ep_reward,
+                           "reward/ep_step": step})
+            if args.use_tensorboard:
+                tf_writer.add_scalar('reward/ep_reward', ep_reward, train_step)
+                tf_writer.add_scalar('reward/step', step, train_step)
+            plt_ep_step.append(step)
+            plt_ep_reward.append(ep_reward)
+    model.save(save_path, args.max_train_step)
     env.close()
-    wandb.finish()
+    if args.use_wandb:
+        wandb.finish()
     # 保存模型配置，即生成config.yaml
     save_config(args, save_path)
-    # plot result
+    fig_path = os.path.join(save_path, "figs")
+    if not os.path.exists(fig_path):
+        os.makedirs(fig_path)
+    # plot reward result
     p1 = plt.figure(figsize=(16, 8))
 
     ax1 = p1.add_subplot(1, 2, 1)
@@ -481,29 +550,69 @@ def train_gym(args):
     ax2.tick_params(labelsize=12)
     ax2.grid(linestyle='-.')
 
-    ax1.plot(plt_ep, plt_step)
-    ax1.set_xlabel('Number of training episodes', font1)
+    ax1.plot(plt_train_step, plt_ep_step)
+    ax1.set_xlabel('Number of training steps', font1)
     ax1.set_ylabel('steps', font1)
 
     label1 = ax1.get_xticklabels() + ax1.get_yticklabels()
     [label.set_fontname('Times New Roman') for label in label1]
 
-    label1 = ax1.get_xticklabels() + ax1.get_yticklabels()
-    [label.set_fontname('Times New Roman') for label in label1]
-
-    ax2.plot(plt_ep, plt_ep_reward)
-    ax2.set_xlabel('Number of training episodes', font1)
+    ax2.plot(plt_train_step, plt_ep_reward)
+    ax2.set_xlabel('Number of training steps', font1)
     ax2.set_ylabel(r'ep_reward', font1)
 
     label2 = ax2.get_xticklabels() + ax2.get_yticklabels()
     [label.set_fontname('Times New Roman') for label in label2]
 
     plt.subplots_adjust(wspace=0.3)
-    fig_path = os.path.join(save_path, "figs")
-    if not os.path.exists(fig_path):
-        os.makedirs(fig_path)
-    plt.savefig(os.path.join(fig_path, "train_fig.jpg"))
-    print("train figure is saved in {}".format(str(os.path.join(fig_path, "train_fig.jpg"))))
+    plt.savefig(os.path.join(fig_path, "train_reward_fig.jpg"))
+    # plot loss result
+    p1 = plt.figure(figsize=(12, 10))
+
+    ax1 = p1.add_subplot(2, 2, 1)
+    ax1.tick_params(labelsize=12)
+    ax1.grid(linestyle='-.')
+    ax2 = p1.add_subplot(2, 2, 2)
+    ax2.tick_params(labelsize=12)
+    ax2.grid(linestyle='-.')
+    ax3 = p1.add_subplot(2, 2, 3)
+    ax3.tick_params(labelsize=12)
+    ax3.grid(linestyle='-.')
+    ax4 = p1.add_subplot(2, 2, 4)
+    ax4.tick_params(labelsize=12)
+    ax4.grid(linestyle='-.')
+
+    ax1.plot(plt_train_step, plt_critic_loss)
+    ax1.set_xlabel('Number of training steps', font1)
+    ax1.set_ylabel('critic loss', font1)
+
+    label1 = ax1.get_xticklabels() + ax1.get_yticklabels()
+    [label.set_fontname('Times New Roman') for label in label1]
+
+    ax2.plot(plt_train_step, plt_actor_loss)
+    ax2.set_xlabel('Number of training steps', font1)
+    ax2.set_ylabel(r'actor loss', font1)
+
+    label2 = ax2.get_xticklabels() + ax2.get_yticklabels()
+    [label.set_fontname('Times New Roman') for label in label2]
+
+    ax3.plot(plt_train_step, plt_alpha_loss)
+    ax3.set_xlabel('Number of training steps', font1)
+    ax3.set_ylabel('alpha loss', font1)
+
+    label3 = ax3.get_xticklabels() + ax3.get_yticklabels()
+    [label.set_fontname('Times New Roman') for label in label3]
+
+    ax4.plot(plt_train_step, plt_alpha)
+    ax4.set_xlabel('Number of training steps', font1)
+    ax4.set_ylabel(r'alpha', font1)
+
+    label4 = ax4.get_xticklabels() + ax4.get_yticklabels()
+    [label.set_fontname('Times New Roman') for label in label4]
+
+    plt.subplots_adjust(wspace=0.3)
+    plt.savefig(os.path.join(fig_path, "train_loss_fig.jpg"))
+    print("train figure is saved in {}".format(str(fig_path)))
     print("训练时间:{}".format(time.time() - begin_time))
 
 
@@ -527,7 +636,7 @@ def eval_gym(args):
     save_path, _ = make_save_path(args.env_name, args.algo_name, is_make_dir=False)
     print("run_dir:{}".format(save_path))
     # 创建智能体
-    model = SAC(args, state_dim, action_space, is_cnn=False)
+    model = CQL(args, state_dim, action_space)
     load_path = os.path.join(os.path.dirname(save_path), "run" + str(args.load_run))
     print("load_path:{}".format(load_path))
     model.load(load_path, episode=args.load_episode)
@@ -574,8 +683,8 @@ if __name__ == '__main__':
     args = parser.parse_args()
     # show env information,
     # get_env_args(args.env_name, render=False)
-    # train_gym(args)
+    train_with_offline_data(args)
     # specify which model to be load and eval
     args.load_run = 1
-    args.load_episode = 200
+    args.load_episode = 40000
     eval_gym(args)

@@ -48,7 +48,7 @@ parser.add_argument("--load_run", default=1, type=int, help="load the model of r
 parser.add_argument("--load_episode", default=300, type=int, help="load the model trained for `load_episode` episode")
 parser.add_argument('--eval_episode', default=30, type=int, help="the number of episode to eval the model")
 # logging choice
-parser.add_argument("--use_tensorboard", default=1, type=int, help="1 as true, 0 as false")
+parser.add_argument("--use_tensorboard", default=0, type=int, help="1 as true, 0 as false")
 parser.add_argument("--use_wandb", default=0, type=int, help="1 as true, 0 as false")
 
 device = 'cpu'
@@ -371,6 +371,11 @@ class SAC:
         for target_param, source_param in zip(self.target_critic_net.parameters(), self.critic_net.parameters()):
             target_param.data.copy_(
                 target_param.data * (1.0 - self.replace_tau) + source_param.data * self.replace_tau)
+        return {'loss/critic loss': q_loss.item(),
+                "loss/actor loss": pi_loss.item(),
+                "loss/alpha loss": alpha_loss.item(),
+                "loss/alpha": self.alpha.clone().item()
+                }
 
     def save(self, save_path, episode):
         base_path = os.path.join(save_path, 'trained_model')
@@ -490,6 +495,11 @@ def train_gym(args):
     plt_ep = []
     plt_step = []
     plt_ep_reward = []
+    plt_train_step = []
+    plt_critic_loss = []
+    plt_actor_loss = []
+    plt_alpha_loss = []
+    plt_alpha = []
     while episode < args.max_episode:
         state, info = env.reset(seed=args.random_seed)
         episode += 1
@@ -503,15 +513,21 @@ def train_gym(args):
             next_state, reward, terminated, truncated, info = env.step(action)
             step += 1
             model.store_transition(state, action, reward, next_state, terminated)
-            if len(model.buffer) >= 2000:
-                model.update()  # model training
+            if len(model.buffer) > 2000:
+                train_info = model.update()  # model training
                 train_count += 1
+                plt_train_step.append(train_count)
+                plt_critic_loss.append(train_info['loss/critic loss'])
+                plt_actor_loss.append(train_info['loss/actor loss'])
+                plt_alpha_loss.append(train_info['loss/alpha loss'])
+                plt_alpha.append(train_info['loss/alpha'])
             state = next_state
             # 累加奖励
             ep_reward += reward
             if terminated or truncated:
-                print("Episode:", episode, "; step:", step, "; Episode Return:", '%.2f' % ep_reward,
-                      '; Trained episode:', train_count)
+                eval_info = {"train_step": train_count, "eval_episode": episode, "step": step,
+                             "ep_reward": round(ep_reward, 2)}
+                print(eval_info)
                 if args.use_wandb:
                     wandb.log({'reward/ep_reward': ep_reward,
                                "reward/ep_step": step})
@@ -525,10 +541,14 @@ def train_gym(args):
         if (episode >= 0.5 * args.max_episode and episode % args.save_interval == 0) or episode == args.max_episode:
             model.save(save_path, episode)
     env.close()
-    wandb.finish()
+    if args.use_wandb:
+        wandb.finish()
     # 保存模型配置，即生成config.yaml
     save_config(args, save_path)
     # plot result
+    fig_path = os.path.join(save_path, "figs")
+    if not os.path.exists(fig_path):
+        os.makedirs(fig_path)
     p1 = plt.figure(figsize=(16, 8))
 
     ax1 = p1.add_subplot(1, 2, 1)
@@ -556,11 +576,55 @@ def train_gym(args):
     [label.set_fontname('Times New Roman') for label in label2]
 
     plt.subplots_adjust(wspace=0.3)
-    fig_path = os.path.join(save_path, "figs")
-    if not os.path.exists(fig_path):
-        os.makedirs(fig_path)
-    plt.savefig(os.path.join(fig_path, "train_fig.jpg"))
-    print("train figure is saved in {}".format(str(os.path.join(fig_path, "train_fig.jpg"))))
+    plt.savefig(os.path.join(fig_path, "train_reward_fig.jpg"))
+
+    # plot loss result
+    p1 = plt.figure(figsize=(12, 10))
+
+    ax1 = p1.add_subplot(2, 2, 1)
+    ax1.tick_params(labelsize=12)
+    ax1.grid(linestyle='-.')
+    ax2 = p1.add_subplot(2, 2, 2)
+    ax2.tick_params(labelsize=12)
+    ax2.grid(linestyle='-.')
+    ax3 = p1.add_subplot(2, 2, 3)
+    ax3.tick_params(labelsize=12)
+    ax3.grid(linestyle='-.')
+    ax4 = p1.add_subplot(2, 2, 4)
+    ax4.tick_params(labelsize=12)
+    ax4.grid(linestyle='-.')
+
+    ax1.plot(plt_train_step, plt_critic_loss)
+    ax1.set_xlabel('Number of training steps', font1)
+    ax1.set_ylabel('critic loss', font1)
+
+    label1 = ax1.get_xticklabels() + ax1.get_yticklabels()
+    [label.set_fontname('Times New Roman') for label in label1]
+
+    ax2.plot(plt_train_step, plt_actor_loss)
+    ax2.set_xlabel('Number of training steps', font1)
+    ax2.set_ylabel(r'actor loss', font1)
+
+    label2 = ax2.get_xticklabels() + ax2.get_yticklabels()
+    [label.set_fontname('Times New Roman') for label in label2]
+
+    ax3.plot(plt_train_step, plt_alpha_loss)
+    ax3.set_xlabel('Number of training steps', font1)
+    ax3.set_ylabel('alpha loss', font1)
+
+    label3 = ax3.get_xticklabels() + ax3.get_yticklabels()
+    [label.set_fontname('Times New Roman') for label in label3]
+
+    ax4.plot(plt_train_step, plt_alpha)
+    ax4.set_xlabel('Number of training steps', font1)
+    ax4.set_ylabel(r'alpha', font1)
+
+    label4 = ax4.get_xticklabels() + ax4.get_yticklabels()
+    [label.set_fontname('Times New Roman') for label in label4]
+
+    plt.subplots_adjust(wspace=0.3)
+    plt.savefig(os.path.join(fig_path, "train_loss_fig.jpg"))
+    print("train figure is saved in {}".format(str(fig_path)))
     print("训练时间:{}".format(time.time() - begin_time))
 
 
