@@ -509,7 +509,8 @@ def train_with_offline_data(args):
             plt_ep_reward.append(ep_reward)
     model.save(save_path, args.max_train_step)
     env.close()
-    wandb.finish()
+    if args.use_wandb:
+        wandb.finish()
     # 保存模型配置，即生成config.yaml
     save_config(args, save_path)
     fig_path = os.path.join(save_path, "figs")
